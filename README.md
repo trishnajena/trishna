@@ -1,2 +1,0 @@
-# trishna
-a simple calculator
