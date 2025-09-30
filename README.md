@@ -39,18 +39,6 @@ The calculator is designed to be intuitive:
 
 ---
 
-## 🤝 Contributing
-
-We welcome contributions! If you have suggestions or want to improve the app:
-
-1.  **Fork** the repository.
-2.  Create a new branch: `git checkout -b feature/your-feature-name`
-3.  Make your changes and commit them: `git commit -m 'feat: Added a new feature'`
-4.  Push to the branch: `git push origin feature/your-feature-name`
-5.  Open a **Pull Request**.
-
----
-
 ## 📄 License
 
 This project is licensed under the **[e.g., MIT License]** - see the `LICENSE.md` file for details.
