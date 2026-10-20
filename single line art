@@ -1,0 +1,194 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, colorchooser
+from xml.sax.saxutils import escape
+
+try:
+    from PIL import Image, ImageOps, ImageTk, ImageEnhance
+except ImportError:
+    Image = ImageOps = ImageTk = ImageEnhance = None
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    BaseTk = TkinterDnD.Tk
+except ImportError:
+    DND_FILES = None
+    BaseTk = tk.Tk
+
+
+class OneLineConverter:
+    BG = "#f6f3ed"
+    INK = "#20201f"
+    MUTED = "#77736d"
+    ACCENT = "#dc6848"
+
+    def __init__(self, root):
+        self.root = root
+        root.title("One Line — Photo to Line Art")
+        root.geometry("1100x760")
+        root.minsize(760, 560)
+        root.configure(bg=self.BG)
+        self.source_image = None
+        self.points = []
+        self.stroke = self.INK
+        self.stroke_width = tk.IntVar(value=1)
+        self.density = tk.IntVar(value=5)
+        self.preview_image = None
+        self._build_ui()
+        self.canvas.bind("<Configure>", lambda _e: self.generate() if self.source_image is not None else self._render())
+        root.bind("<Control-o>", lambda _e: self.open_image())
+        root.bind("<Control-s>", lambda _e: self.save_svg())
+        if DND_FILES:
+            self.canvas.drop_target_register(DND_FILES)
+            self.canvas.dnd_bind("<<Drop>>", self._drop_image)
+
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg=self.BG, padx=28, pady=18)
+        header.pack(fill="x")
+        brand = tk.Frame(header, bg=self.BG)
+        brand.pack(side="left")
+        tk.Label(brand, text="ONE LINE", bg=self.BG, fg=self.INK,
+                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
+        tk.Label(brand, text="Turn a picture into one continuous drawing", bg=self.BG,
+                 fg=self.MUTED, font=("Segoe UI", 10)).pack(anchor="w", pady=(4, 0))
+        controls = tk.Frame(header, bg=self.BG)
+        controls.pack(side="right")
+        self._button(controls, "Open picture", self.open_image).pack(side="left", padx=4)
+        tk.Label(controls, text="DETAIL", bg=self.BG, fg=self.MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(10, 4))
+        tk.Scale(controls, from_=3, to=12, orient="horizontal", variable=self.density,
+                 command=lambda _v: self.generate(), length=95, showvalue=True,
+                 bg=self.BG, highlightthickness=0, troughcolor="white").pack(side="left")
+        self._button(controls, "Line color", self.choose_color).pack(side="left", padx=4)
+        self._button(controls, "Save SVG", self.save_svg, True).pack(side="left", padx=(5, 0))
+
+        stage = tk.Frame(self.root, bg=self.BG, padx=28)
+        stage.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(stage, bg="white", highlightthickness=1,
+                                highlightbackground="#e8e4dd")
+        self.canvas.pack(fill="both", expand=True)
+        self.placeholder = self.canvas.create_text(
+            550, 350, text="Drop a picture here\nor click Open picture",
+            fill="#a7a198", font=("Segoe UI", 17), justify="center", tags="placeholder")
+        footer = tk.Frame(self.root, bg=self.BG, padx=28, pady=13)
+        footer.pack(fill="x")
+        self.status = tk.Label(footer, text="Choose a photo to create your single-line drawing.",
+                               bg=self.BG, fg=self.MUTED, font=("Segoe UI", 9))
+        self.status.pack(side="left")
+        tk.Label(footer, text="Ctrl+O open  ·  Ctrl+S export", bg=self.BG,
+                 fg=self.MUTED, font=("Segoe UI", 9)).pack(side="right")
+
+    def _button(self, parent, label, command, primary=False):
+        return tk.Button(parent, text=label, command=command, relief="flat", bd=0,
+                         padx=12, pady=8, cursor="hand2",
+                         bg=self.ACCENT if primary else "white",
+                         fg="white" if primary else self.INK,
+                         activebackground="#c85739" if primary else "#ece8e1",
+                         activeforeground="white" if primary else self.INK,
+                         font=("Segoe UI", 9, "bold"))
+
+    def open_image(self):
+        if Image is None:
+            messagebox.showerror("Pillow is required",
+                                 "Install the app requirements first:\n\npython -m pip install -r requirements.txt")
+            return
+        path = filedialog.askopenfilename(title="Choose a picture", filetypes=[
+            ("Pictures", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff"), ("All files", "*.*")])
+        if path:
+            self.load_image(path)
+
+    def _drop_image(self, event):
+        paths = self.root.tk.splitlist(event.data)
+        if paths:
+            self.load_image(paths[0])
+
+    def load_image(self, path):
+        if Image is None:
+            messagebox.showerror("Pillow is required", "Install dependencies from requirements.txt first.")
+            return
+        try:
+            self.source_image = Image.open(path).convert("RGB")
+            self.source_name = path
+            self.generate()
+        except Exception as error:
+            messagebox.showerror("Could not open picture", str(error))
+
+    def generate(self):
+        if self.source_image is None or Image is None:
+            return
+        canvas_w = max(200, self.canvas.winfo_width())
+        canvas_h = max(200, self.canvas.winfo_height())
+        # Reserve a slim margin and preserve the original photo proportions.
+        scale = min((canvas_w - 50) / self.source_image.width,
+                    (canvas_h - 50) / self.source_image.height)
+        out_w = max(120, int(self.source_image.width * scale))
+        out_h = max(120, int(self.source_image.height * scale))
+        gray = ImageOps.fit(self.source_image.convert("L"), (out_w, out_h))
+        gray = ImageOps.autocontrast(gray, cutoff=1)
+        gray = ImageEnhance.Contrast(gray).enhance(1.35)
+        pix = gray.load()
+        spacing = int(self.density.get())
+        x_step = max(1, out_w // 520)
+        rows = list(range(0, out_h, spacing))
+        self.points = []
+        origin_x = (canvas_w - out_w) / 2
+        origin_y = (canvas_h - out_h) / 2
+        for row_index, base_y in enumerate(rows):
+            xs = list(range(0, out_w, x_step))
+            if not xs or xs[-1] != out_w - 1:
+                xs.append(out_w - 1)
+            if row_index % 2:
+                xs.reverse()
+            # Dark pixels pull the line away from the baseline, making tonal shapes.
+            for x in xs:
+                darkness = 1.0 - pix[x, min(base_y, out_h - 1)] / 255.0
+                offset = darkness * spacing * 0.88
+                self.points.append((origin_x + x, origin_y + base_y + offset))
+        self.status.config(text=f"Generated from {self.source_name.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]} · {len(self.points):,} points")
+        self._render()
+
+    def _render(self):
+        self.canvas.delete("art")
+        self.canvas.delete("placeholder")
+        if not self.points:
+            self.canvas.create_text(max(1, self.canvas.winfo_width()/2),
+                                    max(1, self.canvas.winfo_height()/2),
+                                    text="Drop a picture here\nor click Open picture",
+                                    fill="#a7a198", font=("Segoe UI", 17), justify="center",
+                                    tags="placeholder")
+            return
+        coords = [v for point in self.points for v in point]
+        self.canvas.create_line(*coords, fill=self.stroke, width=self.stroke_width.get(),
+                                capstyle=tk.ROUND, joinstyle=tk.ROUND, smooth=False, tags="art")
+
+    def choose_color(self):
+        picked = colorchooser.askcolor(color=self.stroke, title="Choose line color")[1]
+        if picked:
+            self.stroke = picked
+            self._render()
+
+    def save_svg(self):
+        if not self.points:
+            messagebox.showinfo("No line art yet", "Open or drop a picture first.")
+            return
+        filename = filedialog.asksaveasfilename(title="Save generated line art",
+            defaultextension=".svg", filetypes=[("SVG image", "*.svg")], initialfile="one-line-art.svg")
+        if not filename:
+            return
+        width = max(1, self.canvas.winfo_width())
+        height = max(1, self.canvas.winfo_height())
+        path_data = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y in self.points)
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">\n'
+               f'  <path d="{path_data}" fill="none" stroke="{escape(self.stroke)}" '
+               f'stroke-width="{self.stroke_width.get()}" stroke-linecap="round" stroke-linejoin="round"/>\n</svg>\n')
+        try:
+            with open(filename, "w", encoding="utf-8") as file:
+                file.write(svg)
+            messagebox.showinfo("Saved", f"Your line art was saved to:\n{filename}")
+        except OSError as error:
+            messagebox.showerror("Could not save", str(error))
+
+
+if __name__ == "__main__":
+    app = BaseTk()
+    OneLineConverter(app)
+    app.mainloop()
