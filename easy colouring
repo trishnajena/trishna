@@ -1,0 +1,339 @@
+"""Color a selected region in a line drawing by typing or speaking a color.
+
+Install the required image library with:
+    python -m pip install Pillow
+
+Optional voice input:
+    python -m pip install SpeechRecognition PyAudio
+
+Run with:
+    python color_by_voice.py
+"""
+
+from __future__ import annotations
+
+import threading
+import tkinter as tk
+from tkinter import colorchooser, filedialog, messagebox, ttk
+
+from PIL import Image, ImageColor, ImageTk
+
+try:
+    import speech_recognition as sr
+except ImportError:
+    sr = None
+
+
+class ColorByVoiceApp:
+    PREVIEW_WIDTH = 850
+    PREVIEW_HEIGHT = 620
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Color by Voice")
+        self.root.geometry("1120x760")
+        self.root.minsize(780, 560)
+
+        self.image: Image.Image | None = None
+        self.preview: ImageTk.PhotoImage | None = None
+        self.scale = 1.0
+        self.offset_x = 0
+        self.offset_y = 0
+        self.selected: tuple[int, int] | None = None
+        self.undo_stack: list[Image.Image] = []
+        self.redo_stack: list[Image.Image] = []
+        self.tolerance = tk.IntVar(value=35)
+        self.color_text = tk.StringVar()
+        self.status = tk.StringVar(value="Open a drawing to begin.")
+
+        self._build_ui()
+        self.root.bind("<Configure>", self._on_resize)
+
+    def _build_ui(self) -> None:
+        outer = ttk.Frame(self.root, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Color by Voice", font=("Segoe UI", 22, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Open a line drawing, click inside a shape, then say or type a color.",
+        ).pack(anchor="w", pady=(2, 12))
+
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True)
+
+        canvas_frame = ttk.Frame(body)
+        canvas_frame.pack(side="left", fill="both", expand=True, padx=(0, 14))
+        self.canvas = tk.Canvas(canvas_frame, background="#f0f2f5", highlightthickness=1,
+                                highlightbackground="#d8dde4")
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+
+        controls = ttk.Frame(body, width=260)
+        controls.pack(side="right", fill="y")
+        controls.pack_propagate(False)
+
+        ttk.Button(controls, text="Open drawing…", command=self.open_image).pack(fill="x", pady=(0, 8))
+
+        ttk.Label(controls, text="1. Click inside a closed shape").pack(anchor="w", pady=(4, 8))
+        ttk.Label(controls, text="2. Enter a color name or hex value").pack(anchor="w")
+        color_row = ttk.Frame(controls)
+        color_row.pack(fill="x", pady=(5, 8))
+        self.color_entry = ttk.Entry(color_row, textvariable=self.color_text)
+        self.color_entry.pack(side="left", fill="x", expand=True)
+        self.color_entry.bind("<Return>", lambda _event: self.apply_color())
+        ttk.Button(color_row, text="Pick", width=5, command=self.choose_color).pack(side="left", padx=(5, 0))
+        ttk.Button(controls, text="Apply color", command=self.apply_color).pack(fill="x")
+
+        ttk.Label(controls, text="3. Or use voice input").pack(anchor="w", pady=(16, 5))
+        self.voice_button = ttk.Button(controls, text="🎙 Speak a color", command=self.listen_for_color)
+        self.voice_button.pack(fill="x")
+        if sr is None:
+            self.voice_button.state(["disabled"])
+            ttk.Label(controls, text="For voice, install SpeechRecognition and PyAudio.",
+                      wraplength=245).pack(anchor="w", pady=(5, 0))
+
+        ttk.Separator(controls).pack(fill="x", pady=16)
+        ttk.Label(controls, text="Fill tolerance").pack(anchor="w")
+        tolerance_row = ttk.Frame(controls)
+        tolerance_row.pack(fill="x")
+        ttk.Scale(tolerance_row, from_=5, to=100, variable=self.tolerance, orient="horizontal").pack(
+            side="left", fill="x", expand=True
+        )
+        self.tolerance_value = ttk.Label(tolerance_row, text="35", width=4)
+        self.tolerance_value.pack(side="right")
+        self.tolerance.trace_add("write", self._update_tolerance_label)
+
+        undo_row = ttk.Frame(controls)
+        undo_row.pack(fill="x", pady=(16, 7))
+        self.undo_button = ttk.Button(undo_row, text="Undo", command=self.undo, state="disabled")
+        self.undo_button.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        self.redo_button = ttk.Button(undo_row, text="Redo", command=self.redo, state="disabled")
+        self.redo_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Button(controls, text="Save colored image…", command=self.save_image).pack(fill="x")
+
+        ttk.Label(controls, textvariable=self.status, wraplength=245, foreground="#555f6b").pack(
+            anchor="w", pady=(16, 0)
+        )
+        ttk.Label(controls, text="Tip: closed, dark outlines give the cleanest fills.",
+                  wraplength=245, foreground="#68727d").pack(anchor="w", pady=(10, 0))
+
+    def _update_tolerance_label(self, *_args) -> None:
+        self.tolerance_value.configure(text=str(int(float(self.tolerance.get()))))
+
+    def _on_resize(self, event: tk.Event) -> None:
+        if event.widget is self.root and self.image is not None:
+            self.root.after_idle(self._draw_image)
+
+    def open_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choose a drawing",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.image = Image.open(path).convert("RGB")
+        except Exception as exc:
+            messagebox.showerror("Could not open image", str(exc))
+            return
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.selected = None
+        self._update_history_buttons()
+        self._draw_image()
+        self.status.set("Drawing loaded. Click inside a shape, then choose a color.")
+
+    def _draw_image(self) -> None:
+        if self.image is None:
+            return
+        self.canvas.update_idletasks()
+        cw = max(1, self.canvas.winfo_width())
+        ch = max(1, self.canvas.winfo_height())
+        iw, ih = self.image.size
+        self.scale = min(cw / iw, ch / ih)
+        new_size = (max(1, round(iw * self.scale)), max(1, round(ih * self.scale)))
+        rendered = self.image.resize(new_size, Image.Resampling.LANCZOS)
+        self.preview = ImageTk.PhotoImage(rendered)
+        self.offset_x = (cw - new_size[0]) // 2
+        self.offset_y = (ch - new_size[1]) // 2
+        self.canvas.delete("all")
+        self.canvas.create_image(self.offset_x, self.offset_y, anchor="nw", image=self.preview)
+        if self.selected:
+            x, y = self.selected
+            px, py = self.offset_x + x * self.scale, self.offset_y + y * self.scale
+            self.canvas.create_oval(px - 5, py - 5, px + 5, py + 5, outline="#6757e8", width=2)
+
+    def _on_canvas_click(self, event: tk.Event) -> None:
+        if self.image is None:
+            self.status.set("Open a drawing first.")
+            return
+        x = round((event.x - self.offset_x) / self.scale)
+        y = round((event.y - self.offset_y) / self.scale)
+        if not (0 <= x < self.image.width and 0 <= y < self.image.height):
+            return
+        self.selected = (x, y)
+        self._draw_image()
+        self.status.set("Area selected. Say or enter a color.")
+
+    def choose_color(self) -> None:
+        chosen = colorchooser.askcolor(title="Choose a fill color")[1]
+        if chosen:
+            self.color_text.set(chosen)
+            self.apply_color()
+
+    def apply_color(self, color: str | None = None) -> None:
+        if self.image is None:
+            self.status.set("Open a drawing first.")
+            return
+        if self.selected is None:
+            self.status.set("Click inside a shape first.")
+            return
+        name = (color if color is not None else self.color_text.get()).strip()
+        try:
+            rgb = ImageColor.getrgb(name)
+        except ValueError:
+            self.status.set("Color not recognized. Try red, skyblue, or #33aa77.")
+            return
+
+        pixels = self.image.load()
+        width, height = self.image.size
+        sx, sy = self.selected
+        seed = pixels[sx, sy]
+        if self._is_outline(seed):
+            self.status.set("That spot is on an outline. Click farther inside the shape.")
+            return
+
+        tolerance = int(float(self.tolerance.get()))
+        limit = tolerance * tolerance * 3
+        visited = bytearray(width * height)
+        stack = [sy * width + sx]
+        region: list[int] = []
+
+        while stack:
+            pos = stack.pop()
+            if pos < 0 or pos >= width * height or visited[pos]:
+                continue
+            visited[pos] = 1
+            x, y = pos % width, pos // width
+            current = pixels[x, y]
+            if self._is_outline(current):
+                continue
+            distance = sum((current[channel] - seed[channel]) ** 2 for channel in range(3))
+            if distance > limit:
+                continue
+            region.append(pos)
+            if x > 0:
+                stack.append(pos - 1)
+            if x + 1 < width:
+                stack.append(pos + 1)
+            if y > 0:
+                stack.append(pos - width)
+            if y + 1 < height:
+                stack.append(pos + width)
+
+        if not region:
+            self.status.set("No fillable area found. Try another spot inside the shape.")
+            return
+        if len(region) > width * height * 0.82 and width * height > 10_000:
+            if not messagebox.askyesno("Large fill", "This area covers most of the picture. Fill it anyway?"):
+                return
+
+        self.undo_stack.append(self.image.copy())
+        if len(self.undo_stack) > 20:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+        fill = tuple(rgb[:3])
+        for pos in region:
+            pixels[pos % width, pos // width] = fill
+        self._draw_image()
+        self._update_history_buttons()
+        self.status.set(f"Filled the area with {name}.")
+
+    @staticmethod
+    def _is_outline(rgb: tuple[int, ...]) -> bool:
+        return rgb[0] < 65 and rgb[1] < 65 and rgb[2] < 65
+
+    def listen_for_color(self) -> None:
+        if sr is None:
+            self.status.set("Install SpeechRecognition and PyAudio to use voice input.")
+            return
+        if self.selected is None:
+            self.status.set("Click inside a shape first.")
+            return
+        self.voice_button.state(["disabled"])
+        self.status.set("Listening… say a color after the beep.")
+        threading.Thread(target=self._recognize_color, daemon=True).start()
+
+    def _recognize_color(self) -> None:
+        recognizer = sr.Recognizer()
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=4)
+            phrase = recognizer.recognize_google(audio)
+            self.root.after(0, lambda: self._voice_result(phrase))
+        except sr.WaitTimeoutError:
+            self.root.after(0, lambda: self._voice_error("I did not hear anything. Try again."))
+        except sr.UnknownValueError:
+            self.root.after(0, lambda: self._voice_error("I could not understand that. Try saying a color again."))
+        except sr.RequestError:
+            self.root.after(0, lambda: self._voice_error("Speech service unavailable. Type the color instead."))
+        except Exception as exc:
+            self.root.after(0, lambda message=str(exc): self._voice_error(f"Microphone error: {message}"))
+
+    def _voice_result(self, phrase: str) -> None:
+        self.voice_button.state(["!disabled"])
+        self.color_text.set(phrase)
+        self.apply_color(phrase)
+
+    def _voice_error(self, message: str) -> None:
+        self.voice_button.state(["!disabled"])
+        self.status.set(message)
+
+    def undo(self) -> None:
+        if self.image is None or not self.undo_stack:
+            return
+        self.redo_stack.append(self.image.copy())
+        self.image = self.undo_stack.pop()
+        self._draw_image()
+        self._update_history_buttons()
+        self.status.set("Last fill undone.")
+
+    def redo(self) -> None:
+        if self.image is None or not self.redo_stack:
+            return
+        self.undo_stack.append(self.image.copy())
+        self.image = self.redo_stack.pop()
+        self._draw_image()
+        self._update_history_buttons()
+        self.status.set("Fill restored.")
+
+    def _update_history_buttons(self) -> None:
+        self.undo_button.configure(state="normal" if self.undo_stack else "disabled")
+        self.redo_button.configure(state="normal" if self.redo_stack else "disabled")
+
+    def save_image(self) -> None:
+        if self.image is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save colored drawing",
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg *.jpeg")],
+        )
+        if path:
+            try:
+                self.image.save(path)
+                self.status.set(f"Saved image to {path}")
+            except Exception as exc:
+                messagebox.showerror("Could not save image", str(exc))
+
+
+def main() -> None:
+    root = tk.Tk()
+    ColorByVoiceApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
